@@ -1,0 +1,1277 @@
+---
+title: "Bias Correction for Landsat and Sentinal SST products in NGWOS basins"
+author: "RSWQ"
+date: "6/8/2021"
+output: html_document
+---
+
+**Summary** 
+- a markdown document that Outlines methodology that we can use to develop a regression model to correct for bias in the temperature products that we get from EROS   
+- this includes code, psuedocode, methods from literature, ideas, stuff like that 
+- Covers everything from data analysis, feature engineering, handling missing values, pre-processing techniques
+- Identification of algorithms to run: families of linear regression, non-linear regression, decision tress. Methods to tune hyperparamters
+- Evaluation of models: accuracy metrics and analysis of residuals
+- iterative process -> find conditions where model doesnt work well and work on predictors, rerun models
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) # file settings
+setwd("C:/NYBackup/Remote_Sensing") # local working directing
+
+```
+
+# Packages
+
+```{r packages message=F, warning=F}
+library(tidyverse) # data wrangling and structuring
+library(DataExplorer) # EDA package
+library(caret) # ML package
+library(skimr) # EDA
+library(GGally) # ggplot extension 
+library(sf) # spatial dataframes
+library(tmap) # interactive mapping
+library(doSNOW) # parallel processing
+library(raster) # raster processing
+library(lubridate)
+# will need packages for individual algorithms that are wrapped by caret
+```
+
+
+##A. Literature Review
+
+An annotated list of articles and documentation used to develop regression methodology
+
+1.    Title: Exploring Machine Learning to Correct Satellite-Derived Sea Surface Temperatures
+      Authors:  Stéphane Saux Picart, Pierre Tandeo, Emmanuelle Autret and Blandine Gausset
+      available: https://www.mdpi.com/2072-4292/10/2/224
+      Published: 1 February 2018 
+      Summary: 
+- The authors compared 4 algorithms to correct RS SST: Simple multi-linear regression, Least Square Shrinkage and Selection Operator (LASSO), Generalised Additive Model (GAM) and random forest. 
+- They recommend *random forest* for geostationary satellites, finding it suitable for large numbers of available collocations due to its ability to predict systematic errors and computational speed once the model has been trained. 
+- Adjusted R2 was about 0.31. They had a lot of data: ~249,000 trained from 08/2013 - 07/2014 with a test set of 236,000 from 08/2014-07/2015. It was a global survey of geosynchronous satellites.
+-The match-up dataset includes satellite SST but also includes some other variables used in the SST processing such as Numerical Weather Prediction (NWP) model output (e.g., total atmospheric content of water vapour) and level 1 SEVIRI brightness temperature in the channels of interest for SST retrieval.
+- truth data was drifting buoys at night only 
+- variables used in model: Lat, wind speed, solar zenith angle, satelite zenith angle, integrated water vapour, Difference between channel 3.9  μ m and 8.7  μ m averaged in  5×5  pixels box, Difference between channel 10.8  μ m and 12.0  μ m averaged in  5×5  pixels box, Number of valid retrievals (quality level 3, 4 or 5) in  5×5  pixels box, Standard deviation of SST in  5×5  pixels box,  SST retrieved from SEVIRI: Note that all this information is available without delay. This would allow an online statistical model to produce SST error in real time so long as the model is already trained. 
+- water vapor is the primary cause of error 
+- diurnal effects could be significant
+- The performance of each model is assessed using R2adj and RMSE
+- *These results show that the link between ΔSST and X covariates is clearly nonlinear*
+- non linear algorithms manage to reduce the zonal biases associated with high water vapour content, but require large matchup datasets to train.
+_____________________________________________________________________________________________
+
+2.    Title: Machine learning in geosciences and remote sensing
+      Author(s): David J.LaryaAmir H.AlavibAmir H.GandomicAnnette L.Walkerd
+      available: https://www.sciencedirect.com/science/article/pii/S1674987115000821
+      Published: 17 July 2015
+      Summary: 
+- Overview of ML applications in geoscience...
+_____________________________________________________________________________________________
+
+3.    Title: The Caret Package
+      Author(s): Max Kuhn
+      available: https://topepo.github.io/caret/index.html
+      Published: 2019-03-27
+      Summary:   Contains thorough details of the R caret (Classification And REgression Training) package. Includes visualization, pre-processing, model training, evaluation, algorithm details, and advanced supervised machine learning concepts and techniques; with code examples 
+      Webinar: https://www.youtube.com/watch?v=7Jbb2ItbTC4
+      Webinar: https://www.youtube.com/watch?v=z8PRU46I3NY
+_____________________________________________________________________________________________ 
+
+4.    Title: Coastal sea surface temperature variability from Landsat infrared data
+      Author(s): Andrew Thomas, Deirdre Byrne, Ryan Weatherbee 
+      available: http://www.seasurface.umaine.edu/pdf/2002_RSE_Thomas_etal.pdf
+      Published: 6 January 2002
+      Summary: 
+- study was performed 20 years ago data was from 1986 to 1996 - are results applicable?
+- 
+_____________________________________________________________________________________________      
+
+5.    Title: Comparison of Remotely-Sensed Sea Surface Temperature and Salinity Products With in Situ Measurements From British Columbia, Canada
+      Author(s): Krishna K. Thakur, Raphaël Vanderstichel, Jeffrey Barrell, Henrik Stryhn, Thitiwan Patanasatienkul and Crawford W. Revie
+      available: https://www.frontiersin.org/articles/10.3389/fmars.2018.00121/full
+      Published: 06 April 2018
+      Summary:
+- study compared different satellites based on retrieval, concordance correlation coefficient , highest index of agreement, fewest missing values, and mean and SD values for bias, when compared to in situ measurements
+- mixed linear regression model was used 
+- The in situ measurements at 1 m depth were deemed to be the best/most reasonable depth to compare with RS measurements.
+- A number of metrics were used to assess the relationship between products and in situ measurements. First, the difference between the two measurements (value from the overlapping pixel of the RS product minus the in situ measurement, referred to as “bias”) was computed. 
+- The mean, standard deviation (SD), and root mean square error (RMSE) of these biases were estimated. Pearson correlation coefficients and concordance correlation coefficients (CCC) between pairs of measurements were also computed
+- handling of multiple in-situ points within a pixel
+- index of agreement (d-index) to compare in situ measurements with RS products; this approach has been widely used to assess the performance of hydrologic models (Zambrano-Bigiarini, 2011). The d-index (see Appendix for formula) represents the ratio between RMSE and the potential error between the two measurements (Willmott, 1984; Swierczynska et al., 2016). It is also dimensionless, with a value that ranges from 0 (no agreement at all) to 1 (perfect agreement), and is sensitive to differences between two measurements.
+- a mixed linear regression model was fitted to predict the in situ measurement, using the best performing RS product as the predictor, with sampling site as a random effect (allowing capture of the variability in both the intercept and the coefficient of the predictor), and accounting for autocorrelation between residuals of daily measurements within each site with a first-order autoregressive (AR1) or exponential autocorrelation structure. In order to meet the assumption of linearity, the fitted model also tested functional forms of the predictor using quadratic terms (both as fixed and random effects) and evaluated the fit of the model using both the significance of the additional terms and likelihood ratio test for the nested models. For this analysis, pixels were not included as a random effect due to limited replication at that level.
+- SST products from IR sensors, such as those on MODIS, are sensitive to cloud cover (a primary cause of missing data), while those from microwave sensors are sensitive to precipitation, land contamination, and surface roughness (Donlon et al., 2012). Microwave sensors are limited to much coarser spatial resolution than products derived from IR bands
+
+_____________________________________________________________________________________________     
+
+6.    Title: Statistical Validation of MODIS-Based Sea Surface
+Temperature in Shallow Semi-Enclosed Marginal Sea:
+A Comparison between Direct Matchup and Triple Collocation
+      Author(s): Ali K. Saleh 1,* and Bader S. Al-Anzi 2
+      available: file:///C:/NYBackup/Remote_Sensing/water-13-01078-v3.pdf
+      Published: 14 April 2021 
+      Summary:
+_____________________________________________________________________________________________
+
+7.    Title: Applied Predictive Modeling
+      Author(s): Max Kuhn, Kjell Johnson
+      available: hardcover
+      Published: 2016
+      Summary: Regression models, some theory, some code
+_____________________________________________________________________________________________
+
+8.    Title: Comparison of Historical Water Temperature Measurements with Landsat Analysis Ready Data Provisional Surface Temperature Estimates for the Yukon River in Alaska
+      Author(s): Carson A. Baughman  and Jeffrey S. Conaway
+      available: https://www.mdpi.com/2072-4292/13/12/2394/htm
+      Published: 2021
+      Summary: 
+-Water stratification in turbulent rivers is minimal and lends itself to RS since SST is representative. 
+-burdensome processing steps required to convert raw TIR data to kinetic water temperature (enter EROS).
+-this study is to determine suitability for Landsat analysis ready data (ARD) from EROS for estimating river water temps
+-utilized three of the above rasters extensively in our study. Surface Temp raster,  PIXELQA raster assigns each pixel a condition (clear terrain, water terrain, cloud shadow, or snow/ice) based on spectral information, and the CDIST raster, which represents the distance (in kilometers) that a quality pixel is from the nearest cloud pixel
+-Using a GIS , we excluded all surface temperature data except those related to water surfaces. We used ESRI’s Reclassify tool and the PIXELQA output raster for each scene to create a clear-water mask. The Extract by Mask tool was then used with the newly derived clear-water mask to isolate pixel values from the ST and CDIST rasters, thereby creating cloud-free, water surface temperature, and distance to cloud rasters. These steps were iterated over every scene using the ModelBuilder function within ESRI’s ArcGIS [37]. Zonal statistics were calculated from both rasters based on zones of interest
+- they id'd AOI in the river representing different challenges: sandbars, shorelines, meandering morphology
+-Agreement between remotely sensed pST and in situ streamgage measurements were tested using the Pearson’s product–moment correlation (r). We reject the null hypothesis (no agreement) if p-values < 0.05 and report the proportion of the variance (r2) in the pST measurement that is dependent on true changes in water temperature as measured by in situ measurements. Accuracy was further validated using root mean square error (RMSE), the variance ratio (VR), and bias.
+-tested residuals that could account fro errors in pST measuremnts: river morphology, atmospheric conditions, month of year (seasonality), year (interannual variation), landsat7 v landsat 8
+- RMSE, variance ration, bias
+- Agreement between pST and streamgage data for the Channel AOI was very good with a Pearson’s product–moment correlation of r = 0.931 and an r2 = 0.87 (Table 1). With a p-value << 0.01, we reject the null hypothesis of no correlation and accept the alternate hypothesis that true correlation exists. Nearly 90% of the variation in the estimated pST is explained by the true variation in water temperature as measured by the USGS streamgage.
+-A fundamental limitation to the pST is due to it being downscaled. The pST product is downscaled to 30 m resolution from the original 100 m resolution thermal bands on all Landsat platforms. Therefore, the optimal agreement between pST estimates and in situ measurements can be found in water bodies where the width and/or diameter are much greater than 100 m
+-Positive and negative residuals occur across the range of pixel count, suggesting that missing data, due to the cloudiness of a scene (at least below cloud cover of 80%) or due to SLC failure, does not influence the accuracy of water surface estimates.
+Land surface temperature estimates from pixels with greater transmission values and greater distances from clouds produced smaller RMSE values.
+-Dates with quality pixels with distance-to-cloud values <10 km have a greater chance of being less accurate, but overall they produce good agreement with the majority of pST estimates falling within 2 °C of streamgage measurements
+_____________________________________________________________________________________________
+
+
+_________________________________________________________________________
+
+10.    Title: Uncertainty estimation method and Landsat 7 global validation for the Landsat surface temperature product
+      Author(s): Kelly G.Laraby & John R.Schott
+      available: https://www.sciencedirect.com/science/article/abs/pii/S0034425718303043
+      Published: 2018
+      Summary: 
+-Cook(2014) performed validation studies using Landsat 5 imagery, where the truth data came from buoy measurements in North American waters (Cook, 2014). The results of this investigation showed that under ideal conditions (e.g. no clouds) the average error in the surface temperature algorithm was −0.262 K, which was encouragingly low.
+- RIT per pixel atmospheric compensation ?
+-In the same study, the Landsat 7 LST retrievals were found to underestimate buoy truth by an average of 0.241K, under ideal conditions (i.e. no clouds). 
+-ases where the distance to the nearest cloud is 0m (surface obscured by cloud) or where the LST error is less than −10K have been excluded. This decision stemmed from the validation of the LST algorithm using Landsat 5 images and buoy truth data, which showed that LST errors more extreme than −10K were being directly influenced by clouds. Theses include cases where the Landsat cloud mask omits clouds, which can lead to the inclusion of undesired validation points; namely, points being influenced by clouds that are much nearer than the distance metric indicates. The exclusion of these validation points is a sensible choice that will create a more accurate depiction of LST performance, for the algorithm cannot be expected to produce appropriate surface temperatures when there are clouds in the way.
+- the LST histograms exhibit the best results in cold climates, and the worst in hot/humid climates.
+-Separate studies revealed that cloud proximity and transmission can be used to help characterize LST performance under different atmospheric conditions, so both metrics were used to sort the global validation data (Laraby et al., 2016; Laraby, 2017).
+
+_____________________________________________________________________________________________      
+
+11.    Title: Artificial Intelligence in Geoscience and Remote Sensing
+      Author(s): David John Lary
+      available: https://books.google.com/books?hl=en&lr=&id=C5uUDwAAQBAJ&oi=fnd&pg=PA105&ots=Su6OidYNtJ&sig=N0O3wh6mUmnySJPmhPG28TxMQao#v=onepage&q&f=false
+      Published: 2010 
+      Summary:
+- Section 3 has descriptions of specific algorithms ANN and SVM with methodologies 
+- For NN: " For our studies, we typically used feed-forward back-propagation neural networks with a Levenberg-Marquardt back-propagation training algorithm ( Levenberg, 1944, Marquardt, 1963, Moré, 1977, Marquardt, 1979)."
+- approaches for integrating data from mulitple sensors
+- "Remote sensing datasets are the result of a complex interaction between the design of a sensor, the spectral response function, stability in orbit, the processing of the raw data, compositing schemes, and post-processing corrections for various atmospheric effects including clouds and aerosols."
+- 
+____________________________________________________________________________________________
+____________________________________________________________________________________________
+
+
+## B. Import Data
+
+1. Merge the in-situ observations that Sam has provided (subdaily_temperature_select_sites.csv) with the remotely sensed values that Neil extracted (ls8_st_data_combined_filt.csv). 
+Both datasets are available on the RSWQ SharePoint site
+
+```{r message=F, warning=F}
+
+
+#1. remotely sensed values that Neil extracted 
+##(ls8_st_data_combined_filt.csv)no site temp data
+ls8.raw <- read.csv("ls8_st_data_combined_filt.csv") %>% 
+  as_tibble() 
+head(ls8.raw)
+
+#2.site info
+site_info <- read.csv("potential_rs_temperature_stream_sites_resolvable_width.csv") %>% 
+  as_tibble %>% 
+  dplyr::select(sitename=site_id,
+                source,
+                resolvable,
+                width_ft)
+head(site_info)
+
+#3. subdaily temperature
+iswt.raw <- read.csv("subdaily_temperature_select_sites.csv") %>% 
+  as_tibble()
+head(iswt.raw)
+
+```
+
+Look at the raw data 
+test that all ls8 sitenames are matched in iswt
+- check for missing leading 0's
+- can sites be in ls8 and not in iswt?
+```{r}
+# find vector of lsat8 sitenames
+ls8.sitenames <- unique(ls8.raw$sitename) # there are 177
+iswt.sitenames <- unique(iswt.raw$sitename) # there are 160
+
+# how many site names in the raw lsat data do not match the in-situ sitenames
+## answer: 127 had match names, 50 did not 
+which(ls8.sitenames %in% iswt.sitenames==TRUE ) %>% length
+which(ls8.sitenames %in% iswt.sitenames==FALSE ) %>% length
+
+# which lsat8 sites were not matched 
+ind <- which(ls8.sitenames %in% iswt.sitenames==F ) 
+ls8.unmatched.sites <- ls8.sitenames[ind] %>% sort()
+
+# which in situ sites were not matched 
+ind2 <- which(iswt.sitenames %in% ls8.sitenames == F)
+iswt.unmatched.sites <- iswt.sitenames[ind] %>% sort
+
+# make a list to compare
+list(ls8=ls8.unmatched.sites, iswt=iswt.unmatched.sites)
+
+# plot data
+```
+
+Function to return list of unmatched sitenames given two dataframes that both have sitename column names
+
+```{r}
+get_unmatched_sites <- function(sat,insitu){
+    
+    # find vector of lsat8 sitenames
+    sat.sitenames <- unique(sat$sitename) # there are 177
+    insitu.sitenames <- unique(insitu$sitename) # there are 160
+    
+    # how many site names in the raw lsat data do not match the in-situ sitenames
+    ## answer: 127 had match names, 50 did not 
+    which(sat.sitenames %in% insitu.sitenames==TRUE ) %>% length
+    which(sat.sitenames %in% insitu.sitenames==FALSE ) %>% length
+    
+    # which lsat8 sites were not matched 
+    ind <- which(sat.sitenames %in% insitu.sitenames==F ) 
+    sat.unmatched.sites <- sat.sitenames[ind] %>% sort()
+    
+    # which in situ sites were not matched 
+    ind2 <- which(insitu.sitenames %in% sat.sitenames == F)
+    insitu.unmatched.sites <- insitu.sitenames[ind] %>% sort
+    
+    # make a list to compare
+    list(sat=sat.unmatched.sites, insitu=insitu.unmatched.sites) %>% 
+      return()
+  
+}
+
+# check to make sure function works 
+get_unmatched_sites(ls8.raw, iswt.raw)[1] %>% unlist == list(ls8=ls8.unmatched.sites, iswt=iswt.unmatched.sites)[1] %>% unlist
+get_unmatched_sites(ls8.raw, iswt.raw)[2] %>% unlist == list(ls8=ls8.unmatched.sites, iswt=iswt.unmatched.sites)[2] %>% unlist
+```
+
+### Clean data to prepare for merging
+- joining in-situ WT to ls8 table 
+- join fields are site numbers and closest time (do we want to aggregate the time?)
+- the sitenum fields are different, need to verify that all sitenames in ls8 have a match in iswt -> remove USGS from sitenames 
+- find a method of merging based on closest time
+- datetimes need to be in POSIXct
+- sitenames should be characters
+
+
+```{r}
+# make a copy of the raw datasets
+ls8 <- ls8.raw
+iswt <- iswt.raw
+
+# remove 'USGS-' from all ls8$sitename
+ls8$sitename <- str_replace_all(ls8$sitename, "USGS-", "")
+iswt$sitename <- str_replace_all(iswt$sitename, "USGS-", "")
+
+# check to see unmatched sitenames - any other ways to get a match?
+get_unmatched_sites(ls8,iswt)
+
+
+# returns all ls8 that DO have a match 
+## 154 sites -> 23 had no match 
+ind <- which(unique(ls8$sitename) %in% unique(iswt$sitename)==TRUE )
+length(ind)
+
+# what are the names of the matching stations
+matching.sitenames <- unique(ls8$sitename)[ind]
+
+# retrieve just cases with matching station names
+ls8 <- ls8 %>% filter(sitename %in% matching.sitenames) %>% 
+  dplyr::select(sitename, date, datetimeutc, meanwatertempC)
+
+
+iswt <- iswt %>% filter(sitename %in% matching.sitenames)
+
+# check to see that both datasets have the same number 
+ls8$sitename %>% unique %>% length == iswt$sitename %>% unique %>% length 
+
+# make sure each station now has a matching name
+which(unique(ls8$sitename) %in% unique(iswt$sitename)==TRUE ) %>% length
+ 
+```
+
+Sync data types for the times
+
+```{r}
+#1. datetimeutc 
+
+# A. LS8
+ls8 <- transform(ls8, date=as.Date(as.character(date),"%Y%m%d"))
+#ls8 <- transform(ls8, date=as.character(date))
+
+#datetime
+ls8$datetimeutc <- as.POSIXct(ls8$datetimeutc, 
+                             format="%Y-%m-%d %H:%M", 
+                             tz="UTC") 
+
+
+iswt <- unite(data=iswt,col=datetimeutc, date,time, sep=" ", remove=F)
+iswt$datetimeutc <- as.POSIXct(iswt$datetimeutc, 
+                             format="%Y-%m-%d %H:%M", 
+                             tz="UTC") 
+
+iswt <- transform(iswt, date=as.Date(as.character(date),"%Y-%m-%d"))
+#iswt <- transform(iswt, date=as.character(date))
+
+```
+
+
+### Merge data
+- split the data frames into smaller sizes to test code then figure it out later
+- based on sitename, and closest time
+
+```{r}
+# ls8.test <- ls8 %>% filter(sitename %in% matching.sitenames[1:140]) %>% as_tibble()
+# iswt.test <- iswt %>% filter(sitename %in% matching.sitenames[1:140]) %>% as_tibble()
+
+# make sure each station now has a matching name
+which(unique(ls8$sitename) %in% unique(iswt$sitename)==FALSE )
+
+# ls8.test$sitename <- as.factor(ls8.test$sitename)
+# iswt.test$sitename <- as.factor(iswt.test$sitename)
+class(ls8$sitename)==class(iswt$sitename)
+
+```
+
+Method 1. Inner Join
+```{r}
+# join works for one - needs to work for all 
+# joinby date and site, get difference between sat time and sample time, 
+match.test <- ls8 %>% 
+  dplyr::inner_join(iswt, by=c("sitename", "date"), keep=T) %>% 
+  mutate(time_diff=abs(difftime(datetimeutc.x,datetimeutc.y))) %>% 
+  group_by(date) %>% 
+  slice(which.min(time_diff)) %>% 
+  mutate(temp_diff=meanwatertempC - temp_degC) #%>% 
+  # dplyr::select(sitename=sitename.x,
+  #               date=date.x,
+  #               datetimeutc=datetimeutc.x,
+  #               sat_wt=meanwatertempC,
+  #               insitu_wt=temp_degC,
+  #               time_diff,
+  #               temp_diff)
+
+match.test  
+
+# which sites were in the match  
+unique(match.test$sitename)
+
+# how many sites were in the match 
+paste0("there were ", unique(match.test$sitename) %>% length, " matched sites ", "out of ", unique(ls8$sitename) %>% length)
+
+```
+
+Method 2. Left Join 
+join to in situ
+```{r warning=FALSE, paged.print=FALSE}
+ls8$date
+match.test2 <- ls8 %>% 
+  dplyr::left_join(ls8, by=c("sitename", "date"), keep=F)
+match.test2
+```
+
+Method 3. Data.Table
+```{r}
+library(data.table)
+
+test.match3 <- data.table(ls8, key=c("sitename","date"))[
+  data.table(iswt, key=c("sitename","date")),
+  allow.cartesian=TRUE
+]
+
+test.match3
+# which sites were in the match  
+unique(test.match3$sitename)
+
+# how many sites were in the match 
+paste0("there were ", unique(test.match3$sitename) %>% length, " matched sites ", "out of ", unique(ls8$sitename) %>% length)
+```
+
+Method 4. Merge
+```{r}
+test.match4 <- merge(ls8,iswt)
+
+```
+
+Method 5. For loop
+```{r}
+# Read in Remotely sensed data
+# rs <- read.csv("C:/Users/tvking/DOI/GS-WMA-RSWQ - Documents/General/analysis/data/field_observations/temperature/sites/ls8_st_data_combined_filt.csv",stringsAsFactors = F)
+ls8$date <- as.Date(strptime(x = ls8$date, format = '%Y%m%d', tz = "UTC"))
+ls8$date.time <- as.POSIXct(strptime(x = paste0(ls8$date,' ',ls8$utctime), format = '%Y-%m-%d %H:%M:%S', tz = "UTC"))
+
+# remove 'USGS-' from all ls8$sitename
+ls8$sitename <- str_replace_all(ls8$sitename, "USGS-", "")
+iswt$sitename <- str_replace_all(iswt$sitename, "USGS-", "")
+
+# create POSIXct object for datetime 
+iswt$datetimeutc <- as.POSIXct(iswt$datetimeutc, 
+                             format="%Y-%m-%d %H:%M", 
+                             tz="UTC") 
+
+ls8 <- ls8[complete.cases(ls8),]
+
+
+
+ls8$insitu.date <- as.POSIXct('1990-01-01 00:00:00',tz = 'UTC')
+ls8$insitu.temp <- NA
+
+
+
+# Match rs and in-situ values
+for(i in 1:nrow(ls8)){
+site.i <- ls8$sitename[i]
+in.situ.i <- iswt[iswt$sitename == site.i,]
+#print(i)
+if(nrow(in.situ.i)>0){
+index <- which.min(abs(as.numeric(ls8$date.time)[i] - as.numeric(in.situ.i$datetimeutc)))
+ls8$insitu.date[i] <- in.situ.i$datetimeutc[index]
+ls8$insitu.temp[i] <- in.situ.i$temp_degC[index]
+}
+}
+saveRDS(object = ls8,file = "ls8_merge.rds")
+# get latency  between sat and insitu
+# get residual 
+# make sure there are no 1990-01-01 00:00:00 in insitu.date
+#tail(ls8)
+
+df <- readRDS("ls8_merge.rds")
+#iswt$sitename
+#iswt %>% names
+
+# add variables to find the difference in time and difference in temperatures
+df <- df %>% mutate(temp_diff=medianwatertempC- insitu.temp, time_diff=date.time- insitu.date)
+
+# cleanup
+df <- df %>% dplyr::select(sitename, long, lat, pixeltempC,pixeldswe, qualitypercent, waterpercent, nwaterpixel, meanwatertempC, medianwatertempC, minwatertempC, maxwatertempC, basin, datetimeutc_sat=date.time, datetimeutc_insitu=insitu.date, insitu.temp, temp_diff,time_diff)
+
+# quick summary stats and visuals comparing differences
+summary(df$temp_diff)
+summary(as.numeric(df$time_diff))
+
+df %>% arrange(desc(temp_diff))
+df$time_diff <-  as.numeric(df$time_diff, units='secs')
+df$temp_diff_abs <- abs(df$temp_diff)
+df$time_diff_abs <- abs(df$time_diff)  
+
+# histgograms
+hist(df$temp_diff) # normal distribution except for some outliers 
+hist(df$time_diff) # bimodal distribution
+
+# filter extreme values of time - need only within a day (24*60*60= 86400)
+df <- df %>% filter(time_diff_abs < 86400)
+
+# new histograms
+hist(df$time_diff)
+hist(df$temp_diff)
+df %>% arrange(desc(temp_diff))
+
+df %>% filter(temp_diff > 5, temp_diff > -5)
+```
+
+
+### Remove predictors
+- 1. Zero variance predictors: that contain mostly one value and are not useful predictors to models
+- 2. Variables that lack predictive power; IDs etc
+
+```{r}
+library(DataExplorer)
+
+# remove varaibless with no predictive power
+df <- df %>% 
+  dplyr::select(!c(date, utctime,scenename,dswename))
+
+## Find and remove near zero variance predictors 
+#nzv <- nearZeroVar(df) 
+## indicates variables that are near zero variance
+#df <- df[,-nzv]
+
+## Remove other predictors that are of no use: example...
+#remove_vars <- c("entityIds", "dates", "site_id")
+#df <- site_df %>% 
+#  dplyr::select(-remove_vars)
+```
+
+### Change data types
+```{r}
+# basin and source as a factor
+df$source <- as.factor(df$source)
+df$basin <- as.factor(df$basin)
+df$resolvable <- as.factor(df$resolvable)
+
+# make spatial
+df_sp <- st_as_sf(df, coords = c("long", "lat"))
+
+str(df)
+
+```
+____________________________________________________________________________________________
+____________________________________________________________________________________________
+
+
+##C. Pre-Processing
+
+### Summarize & Plot Data
+- Analysis of bias: residiuals=WT_insitu - WT_rs
+  - under what conditions are retrievals biased?
+  - stats:
+  - visuals: spatial plot, heat maps, correlation plots
+- Distribution of target and predictors
+- Outliers and missing values
+- raindrop plot
+
+
+```{r}
+## Get Structure of data
+str(df)
+introduce(df)
+plot_intro(df)
+
+
+
+## Scatter plots of each predictor with target
+# featurePlot()
+# ggpairs(df)
+
+
+## density plot numeric vars
+
+## bar plot categorical vars
+plot_bar(df)
+plot_bar(df, by="basin")
+
+## Distribution of target
+df %>% 
+   ggplot(aes(x=mean_temp_degC, fill=basin)) + 
+   geom_histogram(binwidth = 2, col=4)
+
+# distribution of all numeric
+plot_histogram(df)
+
+
+df %>% 
+   ggplot(aes(x=mean_temp_degC)) + 
+   geom_density(alpha=.3)+ 
+   facet_grid(~basin_name)
+
+
+# plots
+df %>% ggplot(aes(y=qualitypercent, x=basin)) + 
+  geom_boxplot()
+
+df %>% ggplot(aes(y=meanwatertempC, x=basin)) + 
+  geom_boxplot()
+
+site_df$source %>% table()
+site_df$basin_name %>% table
+```
+
+### Feature Selection and Engineering
+Reference: https://www.geeksforgeeks.org/feature-engineering-in-r-programming/
+-  creating new features from existing ones, varialbe selection/removal
+**- based on EDA, domain knowledge, intuition, etc. create new variables from existing data that could be useful predictors**
+- examples: 
+  - seasonal variable (label encoding?)
+  - water vapor content
+  - land interference in pixel (DSWE has categories to ID water - we can estimate uncertainty of water classification from these data)
+  - CDIST raster, the distance (in kilometers) that a quality pixel is from the nearest cloud pixel
+  - binning variables (water temp) 
+  - pixel quality (from PIXELQA raster)
+  - day vs night measurements
+  - waterbody type
+  - waterbody width
+  - stratification potential
+  - Landsat8 or sentinal2 
+  - time delay between in situ and rs measurement
+  - number of pixels analyzed 
+  - standard dev in neighboring pixels 
+  - sensor depth
+  - local morphology of site (ie head of a riffle, downstream of sandbar, stuff like that)
+  - landcover type (ie next to forest vs vegetation )
+  
+#### get landcover 
+-processed in ArcMap and produced a table, landcover.txt, 9/24/2021 with the following steps
+-buffered station points 100m
+-exported NLCD as a tif
+-extracted NLCD pixels from basin maximum extents
+-raster reclassification -> 6 classes, see nlcd_reclass
+  -1=water, 2=developed, 3=barren, 4=forest, 5=pasture/farmland, 6=wetland
+-zonal statistics as table
+```{r}
+landcover <- read.csv("land_cover_processing/land_cover.txt") %>% 
+  dplyr::select(sitename=SITE_ID, lc.COUNT=COUNT, lc.MIN=MIN, lc.MAX=MAX,lc.MEAN=MEAN ,lc.VARIETY=VARIETY,lc.MAJORITY=MAJORITY)
+
+df <- df %>% 
+  left_join(landcover, by="sitename")
+# can be joined by SITE_ID
+
+```
+
+### Outliers
+- Get count of potential outliers for each variable
+**- Options for handling outliers: **
+    -  1. removing entire observation
+    -  2. replacement with an NA  (will be imputed in a later section)
+    -  3. spatial sign transformation (Kuhn and Johnson p. 34)
+
+```{r}
+# get outlier counts
+df %>% 
+   ggplot(aes(x=mean_temp_degC)) + 
+   geom_density(alpha=.3)+ 
+   facet_grid(~basin_name)
+
+# replace outliers?
+
+```
+
+### Colinearities 
+- Some algorithms are sensitive to colinearities: unstable models, numerical errors, degraded model performance  (Kuhn & Johnson p. 45). Redundant predictors can add more complexity to model than information
+- Can be assessed with correlation matrix or variance inflation factor statistic (for linear regression), or feature extraction algorithm on p 47 of Kuhn & Johnson.
+**- Options for handling highly correlated predictors**
+  -  Should highly correlated predictors be removed here (for all algorithms) or just for those that will be negatively impacted?
+
+
+```{r}
+###_____________________________________________________###
+### Feature extraction method ###
+## Find correlation matirx
+# correlations <- cor(df)
+
+## Plot correlation matrix
+# library(corrplot)
+# corrplot(correlations, order = 'hclust') # will group similar variables together. check package documetation for more options 
+
+## Filter highly correlated variables using feature extraction algorithm
+#highCorr <- findCorrelation(correlations, cutoff=0.75)
+#df <- df[,-highCorr]
+###____________________________________________________###
+
+#plot_correlation(na.omit(df), maxcat = 5L)
+```
+
+### Dummy Variables
+https://www.displayr.com/what-are-dummy-variables/
+- for categorical variables some algorithms cannot handle factor data types and will need a transformation.
+- imputation will need all variables to be numeric
+**- should train/test set be dummified for all or some algorithms?**
+
+```{r}
+## Create a "model" then make predictions (caret) or dummify() (DateExplorer)
+#dv <- dummyVars(~ ., data=df[, -target col index])
+#train.dummy <- predict(dv, df[, -target col index])
+str(df)
+sapply(df, function(x) class(x))
+
+## basin, source, 
+df %>% dummify(df, c("basin"))
+
+```
+
+### Missing values
+- Identify scope of missing values across dataset -> are missing values indicated by NA, blanks, NaN, zeroes, or a coded value?
+**- Handle missing values options:**
+  a) Remove observations where missing value occurs
+  b) Impute missing values -> mean value, knn, bagged tree (latter is slower but more predictive power generally)... imputation models can be assessed with accuracy metrics
+  c) Remove the variable that has missing values
+- reference: https://towardsdatascience.com/data-cleaning-with-r-and-the-tidyverse-detecting-missing-values-ea23c519bc62
+- Caret can be used for imputation, but have to create dummy variables first because factors/strings cannot be imputed (one-hot coding)
+
+```{r}
+
+plot_missing(df)
+
+## in caret... preprocess does not actually impute, it creates a model that needs to be predicted on the train dataset which was previously dummified
+# pre.process <- preProcess(train.dummy, method="bagImpute") # or knnImpute
+# imputed.df <- predict(pre.process, train.dummy)
+
+# Take any columns that were imputed and inserted back into original df
+```
+
+### Principle Componant Analysis
+- https://builtin.com/data-science/step-step-explanation-principal-component-analysis
+- Diminesionality reduction method
+- Probably does not apply for this dataset
+
+```{r}
+plot_prcomp(df, variance_cap = 0.9, nrow = 2L, ncol = 2L)
+```
+
+
+
+### Transformations 
+- Box-Cox, log, square root transformations to reduce skewness (can alternatively be done within train())
+- Centering and scaling -> coerces variables to have a mean of 0 and a standard deviation of 1. Some algorithms will become more stabilized by this transformation. 
+    - Variable importance can be directly compared? (is this true?)
+**- If data are to be transformed, should it be done globally, or just for algorithms that will be negatively impacted?**
+- Can be done within train() for individual algorithms
+
+```{r}
+# train(...,
+#       preProc(c("center", "scale", "BoxCox")))
+# df_scaled <- scale(df, center=T, scale=T)
+```
+ 
+### Data Splitting
+Train and Test sets, typically 80/20 split, but depends of total number of observations
+- stratified random samples to ensure train data is representative of entire population
+- Lary (2010) recommends 80/10/10 split for training/RMSE calculation. "This final 10% portion of the data is randomly chosen from the training dataset and is not used in either the training or RMS evaluation. We only use the neural network if the validation scatter diagram, which plots the actual data from validation portion against the neural network estimate, yields a straight-line graph with a slope very close to one and an intercept very close to zero." 
+
+```{r}
+set.seed(3456)
+trainIndex <- createDataPartition(df$insitu.temp , p = .8,
+                                  list = FALSE,
+                                  times = 1) %>% as.vector()
+train <- df[trainIndex,]
+test  <- df[-trainIndex,]
+
+trainX <- train %>% dplyr::select(medianwatertempC)
+trainY <- train %>% dplyr::select(insitu.temp)
+testX <- test %>% dplyr::select(medianwatertempC) 
+testY <- test %>% dplyr::select(insitu.temp)
+```
+
+### Spatial Dataframe
+- create spatial dataframe so GIS operations can be performed in R environment
+- bbox: xmin: -108.5481 ymin: 38.51726 xmax: -74.52207 ymax: 42.82461
+geographic CRS: WGS 84
+
+```{r}
+site_df_sp <- st_as_sf(site_df,
+                       coords=c("longitude",
+                                "latitude"),
+                       crs=st_crs(4326)
+                       )
+```
+
+### Map of Study Area
+- runs slow, are there other interactive plotting widgets that are faster than tmap?
+
+```{r}
+tmap_mode("view") # can toggle between static and interactive
+
+tm_shape(site_df_sp) +
+    tm_dots(col="orange") 
+
+```
+____________________________________________________________________________________________
+____________________________________________________________________________________________
+
+
+## D. Train Models
+- `CARET` package
+- ID algorithms to train
+- ID tuning parameters for each algorithm (from https://topepo.github.io/caret/available-models.html Chapter 6)
+- Cross validation to tune parameters on training dataset
+- make predictions on test set
+- feature selection and engineering can vary by algorithm
+  - center/scaling? ex: scaling needed for distance based models
+  - colinearities?
+
+
+###0. Resampling Technique
+Five repeats of 10-fold-cross-validation
+- estimates how model will work on unseen data
+- used for all algorithms
+- estimation of algorithm specific tuning parameter
+
+```{r}
+ctrl <- trainControl(method="repeatedcv",
+                     number=10,
+                     repeats=5#,
+                     #search="grid")
+)
+```
+
+### 1. Simple Multi-Linear Regression
+- could run one with just SST_rs to establish baseline
+- forward/backward selection for statistically significant variables
+
+```{r}
+# train linear model
+lm_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+      method="lm",
+      trControl=ctrl)
+
+# get model output
+lm_mod
+lm_mod$finalModel
+
+# make predictions
+lm_predict <- predict(lm_mod, test)
+
+# evaluate residuals of the test set 
+lm_predict_df <- data.frame(predicted=lm_predict,actual=test$insitu.temp, basin=test$basin)
+lm_predict_df %>% ggplot(aes(x=predicted,y=actual, col=basin)) + geom_point()
+
+save(lm_mod, file="lm_mod.Rdata")
+load("lm_mod.Rdata")
+```
+
+
+### 2. Generalised Additive Model (GAM)
+- parameter: 
+- used in Picart et al (2018)
+
+```{r}
+# train linear model
+gam_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+      method="gam",
+      tuneLength=10,
+      trControl=ctrl)
+
+# get model output
+gam_mod
+gam_mod$finalModel
+
+# make predictions
+gam_predict <- predict(gam_mod, test)
+
+# evaluate residuals of the test set 
+gam_predict_df <- data.frame(predicted=gam_predict,actual=test$insitu.temp, basin=test$basin)
+gam_predict_df %>% ggplot(aes(x=predicted,y=actual, col=basin)) + geom_point()
+
+save(gam_mod, file="gam_mod.Rdata")
+load("gam_mod.Rdata")
+# set.seed(0515)
+# pls_mod <- train(x=trainX, y=trainY$PH,
+#       method="pls",
+#       tuneLength=10, 
+#       trControl=ctrl)
+# 
+# # plot model tuning
+# pls_mod %>% 
+#   ggplot() + 
+#       ggtitle("Results of PLS cross validation") + 
+#       theme(panel.grid.major = element_blank(), 
+#           panel.grid.minor = element_blank(),
+#           panel.background = element_blank(), 
+#           axis.line = element_line(colour = "black"))
+
+
+```
+
+###  3. Least Square Shrinkage and Selection Operator (LASSO)
+*model fail* need to supply a grid
+- Linear regression with penalty term to non-significant predictors
+- parameter: fraction
+- used in Picart et al (2018)
+
+```{r}
+# train linear model
+lasso_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+      method="enet",
+      #preProc=c("center","scale"),
+      tuneLength=10,
+      trControl=ctrl)
+
+# get model output
+lasso_mod
+lm_mod$finalModel
+
+# make predictions
+lm_predict <- predict(lm_mod, test)
+
+# evaluate residuals of the test set 
+lm_predict_df <- data.frame(predicted=lm_predict,actual=test$insitu.temp, basin=test$basin)
+lm_predict_df %>% ggplot(aes(x=predicted,y=actual, col=basin)) + geom_point()
+# # run model
+# nnet_mod <- train(x=trainXnnet, y=trainY$PH,
+#                   method="enet",
+#                    preProc=c("center","scale") # can also do other transformations here and will be applied to test set data
+#                   tuneLength=20,
+#                   trControl=ctrl
+#                   )
+
+```
+
+### 4. Neural Network
+- Non-linear regression 
+- parameters: size, decay, bag
+- size refers to the number of hidden layers of the neural net. 
+- Weight decay is a term used to regularize the model, penalizing large coefficients
+- see Lary 2010 for descritpion of algorithm and applications
+
+```{r}
+# Grid of hyperparameters
+nnetGrid <- expand.grid(.decay=c(0.001,.1),
+                        .size=c(2:5),
+                        .bag=F)
+
+# train neural net model
+nn_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+                  method="avNNet",
+      #preProc=c("center","scale"),
+                   #preProc=c("center","scale") 
+                  tuneGrid=nnetGrid,
+                  trControl=ctrl,
+                  linout=T,
+                  trace=F,
+                  MaxNWts = 10 * (ncol(train)+1) + 10 +1,
+                  maxit=500
+                  )
+
+# get model output
+nn_mod
+nn_mod$finalModel
+
+# plot tuning parameters
+plot(nn_mod)
+
+# make predictions
+nn_predict <- predict(nn_mod, test)
+
+# evaluate residuals of the test set 
+nn_predict_df <- data.frame(predicted=nn_predict,actual=test$insitu.temp, basin=test$basin)
+nn_predict_df %>% ggplot(aes(x=predicted,y=actual, col=basin)) + geom_point()
+
+save(nn_mod, file="nn_mod.Rdata")
+load("nn_mod.Rdata")
+
+# remove high correlated variables
+# tooHigh <- findCorrelation(cor(trainX), cutoff=.75)
+# trainXnnet <- trainX[,-tooHigh]
+# testXnnet <- testX[,-tooHigh]
+# 
+
+# 
+# # run model
+# nnet_mod <- train(x=trainXnnet, y=trainY$PH,
+#                   method="avNNet",
+                   #preProc=c("center","scale") # can also do other trnqasformations here and will be applied to test set data
+                  # tuneGrid=nnetGrid,
+                  # trControl=ctrl,
+                  # linout=T,
+                  # trace=F,
+                  # MaxNWts = 10 * (ncol(training_cleaned)+1) + 10 +1,
+                  # maxit=500
+                  # )
+# 
+# # plot
+# nnet_mod %>% 
+#   ggplot() + 
+#       ggtitle("Results of nnet cross validation") + 
+#       theme(panel.grid.major = element_blank(), 
+#           panel.grid.minor = element_blank(),
+#           panel.background = element_blank(), 
+#           axis.line = element_line(colour = "black"))
+
+```
+
+### 5. k-Nearest Neighbors (kNN)
+- non-linear regression
+- k: number of neighbors
+- distance based algorithm
+- Lary 2010
+
+```{r}
+# train model; tuning parameter k, number of neighbors
+set.seed(111)
+knn_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+                  method="knn",
+                  tuneLength=20,
+                  trControl=ctrl)
+
+knn_mod %>%
+  ggplot() +
+      ggtitle("Results of KNN cross validation") +
+      theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"))
+
+save(knn_mod, file="knn_mod.Rdata")
+load("knn_mod.Rdata")
+
+# get model output
+knn_mod
+#n_mod$finalModel
+
+# make predictions
+knn_predict <- predict(knn_mod, test)
+
+# evaluate residuals of the test set 
+knn_predict_df <- data.frame(predicted=knn_predict,actual=test$insitu.temp, basin=test$basin)
+knn_predict_df %>% ggplot(aes(x=predicted,y=actual, col=basin)) + geom_point()
+
+```
+	
+### 6. Multivariate Adaptive Regression Spline (MARS)
+- non-linear regression
+- parameters: nprune, degree
+- Multivariate adaptive regression splines (MARS) is a non-parametric algorithm that creates a piece-wise linear model to capture nonlinearities and interactions effects. A MARS model was fit by varying parameters degree(maximum interaction term) and nprune(maximum terms in final model). 
+
+```{r}
+#create MARS grid for hyperparameters
+marsGrid <- expand.grid(.degree=1:2, .nprune=4:10)
+
+mars_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+                   method="earth",
+                   tuneGrid = marsGrid,
+                  trControl=ctrl)
+
+mars_mod %>%
+  ggplot() +
+      ggtitle("Results of KNN cross validation") +
+      theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"))
+
+save(mars_mod, file="mars_mod.Rdata")
+load("mars_mod.Rdata")
+
+# get model output
+mars_mod
+#n_mod$finalModel
+
+# make predictions
+mars_predict <- predict(mars_mod, test)
+
+# evaluate residuals of the test set 
+mars_predict_df <- data.frame(predicted=mars_predict,actual=test$insitu.temp, basin=test$basin)
+mars_predict_df %>% ggplot(aes(x=y,y=actual, col=basin)) + geom_point()
+# # train model
+# mars_mod <- train(x=trainX, y=trainY$PH,
+#                    method="earth",
+#                    tuneGrid = marsGrid,
+#                    trControl=ctrl
+#                    )
+# #plot
+# mars_mod %>% 
+#   ggplot() + 
+#       ggtitle("Results of MARS cross validation") + 
+#       theme(panel.grid.major = element_blank(), 
+#           panel.grid.minor = element_blank(),
+#           panel.background = element_blank(), 
+#           axis.line = element_line(colour = "black"))
+
+
+```
+
+
+### 7. Support Vector Machine (SVM)
+- non-linear regression
+- SVM can handle/prefer many weak predictors
+- C, sigma for linear and radial kernals
+- Cost (C) which is a term that penalizes large residuals, and sigma which sets a threshold distance that disqualifies points from being included in the distance calculation of a given support vector.
+- distance based algorithm -> needs numeric data, create dummy variables for factors 
+- - see Lary 2010 for descritpion of algorithm and applications
+
+```{r}
+# train model 
+# set.seed(2021)
+# grid <- expand.grid(C=c(0.01, 0.1, 1, 2),sigma=c(0.01, 0.1))
+# 
+# svm_mod <- train(x=trainX, y=trainY$PH,
+#                   method="svmRadial",
+#                   tuneLength=10, 
+#                   trControl=ctrl,
+#                  tuneGrid=grid)
+# 
+# # plot
+# svm_mod %>% 
+#   ggplot() + 
+#       ggtitle("Results of SVM cross validation") + 
+#       theme(panel.grid.major = element_blank(), 
+#           panel.grid.minor = element_blank(),
+#           panel.background = element_blank(), 
+#           axis.line = element_line(colour = "black"))
+```
+
+### 8. Random Forest (rf)
+- Trees generally prefer few number of strong predictors and not sensitive to outliers
+- mtry: the number of predictors used as candidates at each iteration split
+- rf uses bootstraped sample of predictors at each iteration
+- used in picart et al
+
+```{r}
+# train model; tuning parameter k, number of neighbors
+set.seed(111)
+rf_mod <- train(insitu.temp ~ medianwatertempC, data= train ,
+                  method="rf",
+                  tuneLength=10,
+                  trControl=ctrl)
+
+save(rf_mod, file="rf_mod.Rdata")
+load("rf_mod.Rdata")
+
+# get model output
+rf_mod
+#n_mod$finalModel
+
+# make predictions
+rf_predict <- predict(rf_mod, test)
+
+# evaluate residuals of the test set 
+rf_predict_df <- data.frame(predicted=rf_predict,actual=test$insitu.temp, basin=test$basin)
+rf_predict_df %>% ggplot(aes(x=predicted,y=actual, col=basin)) + geom_point()
+
+
+```
+
+### 9. Stochastic Gradient Boosting (gbm)
+- Tree-based 
+- In stochastic gradient boosting, regression trees produced at a given iteration step are dependent on values of the previous step (unlike random forests). The tuning parameters, bagging fraction and learning rate govern the dependence of values output by one tree on the next iteration.Increasing the interaction depth would increase the usage of the less important predictors and as a result in a more gradual slope.
+- parameters:
+  - number of iterations (n.trees), 
+  - complexity of tree (interaction.depth), 
+  - learning rate(shrinkage)
+
+```{r}
+# # define tuning grid
+# grid <- expand.grid(interaction.depth=c(1, 3, 5), n.trees = (0:50)*50,
+#                    shrinkage=c(0.01, 0.001),
+#                    n.minobsinnode=10)
+# set.seed(1984)
+# boosted <- train(x=trainX, y=trainY,
+#                  method="gbm",
+#                  tuneGrid=grid,
+#                  verbose=F)
+```
+
+### 10. eXtreme Gradient Boosting (xgboost) 
+- Tree-based emsemble method
+- Very good results in other applications
+```{r}
+# will take a while to run
+# tune_grid <- expand.grid(eta=c(0.05,0.075,0.1),
+#                         nrounds=c(50,75,100),
+#                         max_depth =6:8,
+#                         min_child_weight=c(2, 2.25, 2.5),
+#                         colsample_bytree=c(0.3, 0.4, 0.5),
+#                         gamma=0,
+#                         subsample=1
+#                         )
+# 
+# # parallel processing 
+# cl <- makeCluster(3, type='SOCK')
+# 
+# registerDoSNOW(cl)
+
+## train model
+# xgb_mod <- train(x=trainX, y=trainY$PH,
+#       method="xgbTree",
+#       tuneGrid=tune_grid
+#       trControl = ctrl)
+
+## stop parallel processing 
+#stopCluster(cl)
+```
+
+
+____________________________________________________________________________________________
+____________________________________________________________________________________________
+
+
+##E. Evaluation
+
+- Accuracy metrics: RMSE, MAE, R2 etc -> compare graphically and summarize with a table
+
+### 1. Table
+- Summary of accuracy results and tuning parameters for each algorithm
+
+```{r}
+lm_acc <- postResample(lm_predict_df %>% dplyr::select(predicted), testY)
+gam_acc <- postResample(gam_predict_df %>% dplyr::select(predicted), testY)
+knn_acc <- postResample(knn_predict_df %>% dplyr::select(predicted), testY)
+nn_acc <- postResample(nn_predict_df %>% dplyr::select(predicted), testY)
+rf_acc <- postResample(rf_predict_df %>% dplyr::select(predicted), testY)
+mars_acc <- postResample(mars_predict_df %>% dplyr::select(y), testY)
+
+
+# example of making prediction 
+# predict
+# rf_pred <- predict(rf_mod, newdata=testX) %>% data.frame()
+# rf_acc <- postResample(rf_pred, obs=testY)
+
+# example of table:
+table <- data.frame("Simple Linear" = lm_acc %>% round(3),
+                    "GAM" = gam_acc %>% round(3),
+                    "Neural Net" = nn_acc %>% round(3) ,
+                    "KNN" = knn_acc %>% round(3),
+                    "MARS" = mars_acc %>% round(3),
+                    "RF" = rf_acc %>% round(3)) %>% 
+  t %>%
+  data.frame
+# 
+# table$tuning_parameter <- c("ncomp", "k", "signma, C",  "size, decay", "nprune, degree", "mytry"  ) 
+# 
+# table$value <- c("7", "7", "0.1, 2", "9, 0.01", "21, 3", "11")     
+# 
+table 
+
+
+```
+
+### 2. Graphs
+- graphical view of accuracy results
+- could compare training vs testing results
+
+```{r}
+table$model <- rownames(table)
+table %>%
+  dplyr::select(RMSE, Rsquared, MAE,model) %>%
+  pivot_longer(c(RMSE,Rsquared,MAE)) %>%
+  arrange(value) %>%
+  ggplot(aes(x=model,y=value))+
+  geom_bar(stat="identity", col="black",fill="dodgerblue", alpha=.5)+
+  geom_text(aes(label=value),vjust=1.5, color="white")+
+  facet_wrap(~name, nrow=3, scales = "free_y") +
+      theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black")
+       )
+```
+
+### 3. Model residual analysis 
+- check for constant variance and outliers across parameters and spatially
+- independent and identically distributed errors
+- find conditions where predictions don't work well 
+
+```{r}
+
+
+
+```
+
+
+
+### 4. Varaible Importance
+
+Determination of a variable's importance to a model on a scale from 0-100
+
+```{r}
+
+
+```
+
+____________________________________________________________________________________________
+____________________________________________________________________________________________
+
+
+## X. Issues
+### Data Leakage/Snooping
+models should only be trained with data/operations that will be available when new predictions are made
+https://medium.com/@ODSC/how-to-fix-data-leakage-your-models-greatest-enemy-e34fa26abac5
+- 
+https://medium.com/@ODSC/how-to-fix-data-leakage-your-models-greatest-enemy-e34fa26abac5
+
+### 

@@ -1,0 +1,535 @@
+---
+title: "DATA698_Data_Analysis"
+author: "NYWSC"
+date: "4/23/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r session setup, include=FALSE}
+# working repo
+knitr::opts_knit$set(root.dir = "C:/NYBackup/Remote_Sensing")
+
+# load project-specific user-defined functions  
+source("regression_functions.R")
+
+# sets plotting theme for entire document 
+## look into setting a usgs theme
+theme_set(theme_gg())
+
+# load merged dataframe 
+df_raw <- readRDS('ls8_merged_v2.rds') %>% 
+  as_tibble() %>% 
+  mutate(across(c(is.numeric,-c(long,lat)), round, digits=2))
+df_raw %>% names()
+
+## Map showing basin delineations and location of insitu station locations
+## provide number of observations for each basin and size of each basin 
+
+```
+
+
+# A. Preface
+This document is supports a DATA 698 capstone project where water temperature remote sensing data is evaluated for bias reduction measures.  
+
+## 1.  Purpose of Analysis 
+1. Evaluate the potential for machine learning to correct for bias of water temperature satellite data 
+2. Develop an uncertainty model for bias reduction predictions
+3. Apply calibrated bias and uncertainty models to Landsat ARD LST data to produce remote sensing water temperature values with associated uncertainty
+
+## 2. Description of Dataset
+- The input dataset is `ls8_merged_v2.rds`. It contains in-situ measurements that were retrieved from the National Water Inventory Systmem  and Water Quality Portal which were collected by various agencies and institutions using a variety of field methods. Satellite data from Landsat 8 Collection 2 Analysis Ready Datasets (ARD) were extracted from https://earthexplorer.usgs.gov/ and matched with the in-situ observations to produce the provided dataset. The information contained with the dataset is provisional and not published nor publicly available. Data were collected at monitoring stations within three U.S. river basins (Figure 1). The measurements have been matched with coincident Landsat 8 ARD data based on co-located in-situ and pixel coordinates. Spatially aware predictors were calculated during the ARD extraction process. A 200 meter buffer region was placed around station locations and summary statistics were calculated for each DSWE value, demonstrated in Figure 2. A complete list of variables for the provided dataset are given in the Appendix A. 
+
+*Figure 1. map of study area*
+*Figure 2. DSWE example*
+
+##3. Terminology 
+The following are definitions for some of the terminology used during the analysis: 
+  wst=LST-LST_bias_predicted
+  lst=medianwatertempC 
+  wst_bias= wst - insitu.temp (also model residual error )
+  lst_bias=medianwatertempC - insitu.temp 
+
+# B. Data Analysis
+The sections that follow detail analysis steps taken, including pre-processing, exploratory data analysis, model building, model validation, model uncertainty,analysis of bias reduction, and application of model to gridded spatial product.   
+
+## 1. Data Engineering
+This section includes:
+- general data cleaning - filtering for latency, handling NA values
+- adding external data: publically available GRWL dataset for waterbody widths
+- creating new variables from existing varaibles
+- preprocessing for regression algorithms: imputation, dummy variables, scaling
+- recursive feature elimination to identify important variables 
+- This section and the next section (Exploratory Data Analysis) were performed in an iterative manner to optimize data wrangling processes
+
+### 1. Clean data 
+- The raw merged dataset was processed in the following manner:
+1. *Filtered for latency.* Latency is defined as the time difference between the paired in-situ and satellite measurements.  The add_variables() function has an optional argument for different latency thresholds. During the study, multiple latency intervals were considered. There is a trade-off between a shorter latency period (closer temporal match) and number of observations available for training and testing purposes. Based on EDA and preliminary model outputs, a latency of +/- 4 hours was selected. 
+2. *Removes extreme values* There was only one severe outlier of temperature that was removed 
+3. *Computes new variables from existing variables.* These variables, although not used in the final model run served as valuable  diagnostics for model goodness of fit.
+  - LST_bias= medianwatertempC - insitu.temp: the target variable 
+  - landwaterdiff = medianlandtempC - medianwatertempC,
+  - cloudwaterdiff = mediancloudtempC - medianwatertempC,
+  - maybewaterdiff = medianmaybewatertempC - medianwatertempC,
+  - cov = sdwatertempC/meanwatertempC,
+  - buffrange = maxwatertempC - minwatertempC,
+  - nwaterpixel = npixel * (waterpercent/100), 
+  - year = year(insitu.date),
+4. Brings in external data;  including surrounding land cover and a dataset of waterbody width 
+5. Change data types; includes changing categorical to factor
+6. Handles `NA` values for temp diff variables by setting NA to 0. NA values appear when there are no pixels of a given type within the 200 meter buffer region. 
+
+```{r}
+# apply processing steps to raw merged data
+df <- add_variables(df_raw, lat_thresh = 1/6) %>% filter(pixeldswe!=9, pixelcdistm > 100)
+
+# summary of data 
+obs_per_basin <- df$basin %>% 
+  table %>%  
+  as.data.frame()  
+colnames(obs_per_basin) <- c("basin", "n") 
+obs_per_basin %>% kbl() %>%
+  kable_paper("hover", full_width = F)
+
+# column names
+names(df)
+```
+
+
+## 2. Pre-process 
+Here, steps are taken to process data into a form suitable to run and test machine learning algorithms. The `Caret` package is used for this purpose.
+- imputes any remaining NA values with  median values  
+- selects predictor variables specified in a vector, as a function argument
+- creates dummy variables for categorical data
+- creates a training and testing dataset based on 80/20 split
+- outputs a list of pre-processed dataframes
+
+```{r}
+# predictor_vars <- names(df)[-c(1,5,6,38,3)]
+# predictor_vars <- df %>% dplyr::select(lat, 
+#                                        landpercent,
+#                                        width_m,
+#                                        maybewaterdiff, 
+#                                        medianwatertempC, 
+#                                        landwaterdiff,
+#                                        sdlandtempC) %>% names
+predictor_vars <- df %>% dplyr::select(
+                                       lat, 
+                                       landpercent,
+                                       #width_m,
+                                       medianmaybewatertempC, 
+                                       medianwatertempC,
+                                       sdlandtempC,
+                                       medianlandtempC,
+                                       waterpercent,
+                                       sdwatertempC,
+                                       #cloudpercent
+                                       pixelcdistm
+                                       #mediancloudtempC
+                                       #year
+                                       ) %>% 
+                                names
+
+# run preprocessing 
+preproc_list <- preprocess_vars(df, predictor_vars)
+
+# unpack the list 
+list2env(preproc_list, .GlobalEnv)
+
+training_obs <- training_orig %>% 
+  group_by(basin) %>% 
+  summarize(n=n()) 
+
+testing_orig %>% 
+  group_by(basin) %>% 
+  summarize(n=n()) %>% 
+  left_join(training_obs, by="basin") %>%
+  dplyr::select(basin, n_training=n.y, n_testing=n.x) %>% 
+  kbl() %>%
+  kable_paper("hover", full_width = F)
+
+
+```
+
+## 3. Recursive Feature Elimination
+The recursive feature elimination is a step-wise elimination algorithm based on random forest that uses cross-validation to estimate both number and names of important variables. For purposes of this study, it is used holistically with data analysis and literature review to select training variables.   
+- 9 vars seems optimal: "lat" ,medianwatertempC" "medianlandtempC"  "landpercent"      "waterpercent"     "maybewaterdiff"   "landwaterdiff"   
+ "sdlandtempC"  and "mediancloudtempC"
+- After about 8 or 9 variables, there is only marginal improvement in model performance
+
+```{r}
+# run algorithm on all pre-processed variables and save results
+#rf_profile <- run_rfe(df, predictor_vars)
+#saveRDS(rf_profile, "rfe_all_variables.rds")
+rf_profile <- readRDS("rfe_20220225.rds")
+
+# some output
+rf_profile$bestSubset
+rf_profile$optVariables
+rf_profile$results
+rf_profile$fit
+rf_profile$variables
+
+rf_profile$results %>% 
+  dplyr::select(Variables,MAE,RMSE,Rsquared) %>% 
+  slice(1:10) %>% 
+  pivot_longer(-Variables) %>% 
+  ggplot(aes(x=Variables, y=value, color=name)) + 
+  geom_line()
+```
+
+## 4. Exploratory Data Analysis 
+Below are some of the key pieces of data analysis that are informative of the variables that influence LST bias. From Figure xx we see that the three geographic regions have different distributions of bias.  
+- Upper Colorado River Basin has a uniform distribution of bias with high positive errors. Its observations are from small width waterbodies where there is a high abundance of land pixels with instances of high land land temperature. 
+ 
+- Illinios 
+- Delaware
+
+Across all basins, there was an observed seasonality to the data, with warm land temperature associated with large positive bias in LST values. Similarly, a clear trend is prevalent where small waterbody width is associated with LST bias. The data suggest that interference from land on remotely sensed water pixels contributes to contamination which is introducing high bias to the LST product.
+
+```{r}
+# accuracy metrics/description of error 
+df %>% 
+  group_by(basin) %>% 
+    summarize(
+      n=n(), 
+      sd=sd(lst_bias),
+      min_err=min(lst_bias),
+      max_err=max(lst_bias),
+      CoV=(sd(lst_bias)/mean(lst_bias))*100, # variance of each group standardized by its group mean
+      RMSE=RMSE(medianwatertempC, insitu.temp),
+      MAE=MAE(medianwatertempC,insitu.temp),
+      RMSE_norm=RMSE(meanwatertempC, insitu.temp)/mean(insitu.temp),
+      rss = lst_bias^2 %>% sum,
+      S=sqrt(rss/nrow(df))
+      ) %>% 
+  dplyr::select(basin, n, RMSE, MAE, sd, min_err, max_err)  %>%
+  kbl() %>%
+  kable_paper("hover", full_width = F)
+
+# distribution of errors
+df %>% 
+    # mutate(error_diff=error-lst_bias) %>% 
+    # pivot_longer(c(error,lst_bias)) %>% 
+    ggplot(aes(y=lst_bias, x=basin, fill=basin),col="black") + 
+    geom_violin() + 
+    scale_fill_viridis_d(option="plasma",alpha=.6) +
+    xlab("") + 
+    labs(title = "Distributions of Landsat Bias by Basin") + 
+    ylab("Bias, LST minus in-situ\ntemperature, degrees C") +
+    geom_hline(yintercept=0, col="red", size=1) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+  
+
+# scatterplot: error vs land temp
+df %>% 
+  ggplot(aes(x=medianlandtempC, y=lst_bias, col=landpercent)) + 
+  geom_point(alpha=.5)+
+    geom_smooth(method="lm", se=F) +
+  labs(x="Median land temperature (degrees C) in 200 meter buffer region",
+       y= "LST bias (degrees C)",
+       title="Surrounding Land Influences on Bias",
+       col="Percent\n Land Pixels") + 
+    
+      scale_color_viridis_c(option="plasma") + 
+  facet_wrap(~basin)
+
+# plots of grwl widths and
+df %>%
+  group_by(basin,width_m) %>% 
+  summarize(mean_bias=mean(lst_bias)) %>% 
+  ggplot(aes(x=log(width_m),y=mean_bias, col=basin)) +
+        geom_point(size=3) +
+              scale_color_viridis_d(option="plasma") + 
+  labs(title="LST error aggregated by waterbody width", 
+       x="Natural Log of Width [m]", 
+       y="LST bias (degress C)") + 
+  geom_vline(xintercept = log(200), col="grey", size=1.5)
+
+df %>%
+  ggplot(aes(x=factor(month(datetimeutc, abbr = F)),y=lst_bias)) +
+  geom_violin() + 
+  labs(title="Distribution of LST bias by month of year",
+       x="Month of Year",
+       y="LST Bias (degrees C") + 
+  geom_hline(yintercept=0, col="red")
+```
+
+# D. Modeling
+In this section, 2 types of models are built. Both types of models are trained by the same dataset. 
+1. A regression model to provide point predictions of LST bias 
+2. A quantile random forest model where responses from the 75th and 25th quantile will be used to provide a measure of uncertainty associated with the LST bias predictions produced.
+
+## 1. Train Bias Reduction Models
+For the bias reduction model, 7 candidate algorithms from families of linear, non-linear, and ensemble trees are considered. For each algorithm, hyperparamters were tuned using 10-fold-cross-validation on the training set using the Caret package. 
+
+Run all models
+```{r}
+# run all 8 models 
+test_run <- run_models(preproc_list)
+
+
+# within function, need to edit save location
+# # save model run 
+ saveRDS(test_run, "model_runs/rmodels_20220428.rds")
+# 
+# # load model run 
+test_run <- readRDS("model_runs/rmodels_20220428.rds")
+list2env(test_run, .GlobalEnv)
+```
+
+### a. Model Comparison
+The models built in the previous section are evaluated using goodness of fit metrics calculated on test LST bias predictions versus LST actual bias:
+- RMSE
+- MAE
+- sd 
+- min/max error 
+- R2
+
+Upon comparison, the tree methods yielded the best results for all metrics. The random forest was selected as the final model. Although the stochastic gradient boosted model had almost identical performance, the random forest algorithm is easier for most people to understand. Also, since quantile random forest will later be used to generate prediction intervals, a single model can be used for both purposes.  
+```{r} 
+gof_df <-
+      rbind(get_goodness_of_fit_metrics(test_run$lm, preproc_list)$metrics,
+           #get_goodness_of_fit_metrics(test_run$lasso, preproc_list)$metrics,
+           get_goodness_of_fit_metrics(test_run$gam, preproc_list)$metrics,
+           get_goodness_of_fit_metrics(test_run$knn, preproc_list)$metrics,
+           get_goodness_of_fit_metrics(test_run$svm, preproc_list)$metrics,
+           get_goodness_of_fit_metrics(test_run$nn, preproc_list)$metrics,
+           get_goodness_of_fit_metrics(test_run$rf, preproc_list)$metrics,
+           get_goodness_of_fit_metrics(test_run$sgb, preproc_list)$metrics
+           )
+
+#gof_df$max_abs_error <- ifelse(gof_df$max_err > abs(gof_df$min_err), gof_df$max_err, abs(gof_df$min_err))
+gof_df$family <- c("linear",
+                   #"linear",
+                   "linear",
+                   "non-linear",
+                   "non-linear",
+                   "non-linear",
+                   "tree",
+                   "tree"
+                   ) %>% as.factor()
+
+#acc_df$model <- rownames(acc_df)
+gof_df <- gof_df %>%
+  #mutate(min_err_abs=abs(min_err)) %>% 
+  #arrange(family) %>% 
+  dplyr::select(-c(rss,CoV,S,RMSE_norm)) %>%
+  
+  pivot_longer(-c(model,family)) 
+
+
+gof_df %>% 
+  ggplot(aes(x=reorder(as.factor(model), value, FUN=mean, na.rm=T),y=as.numeric(value)))+
+    geom_bar(stat="identity", aes(col=family), fill="grey90", size=3) +
+    geom_text(aes(label=value %>% round(2)),vjust=1.5, color="black", fontface="bold", size=6)+
+    ylab("Accuracy metric value") + 
+  xlab("")+
+    theme(axis.text.x=element_text(angle = -45, hjust = 0))+
+    scale_color_viridis_d(option="plasma")+
+    #scale_y_continuous(limits = c(0, gof_df$value)) + 
+    facet_wrap(~name, nrow=3, scales = "free_y") +
+    theme(axis.text=element_text(size=18),
+        axis.title=element_text(size=20,face="bold"))
+```
+
+### b. Goodness of Fit 
+The random forest was further evaluated for goodness of fit with diagnostic plots 
+1. Homeoscadasicty 
+2. Predicted vs Acual 
+3. Residuals 
+4. Constanct variance across dataset variables; both those used as predictors and those not used 
+
+The plots suggest a good model fit 
+
+```{r}
+# select model for goodness of fit 
+mod <- rf
+
+# summary stats
+get_goodness_of_fit_metrics(mod, preproc_list)
+
+# graphs
+get_goodness_of_fit_plots(mod, preproc_list)
+
+# overview
+get_model_acc(mod, preproc_list)
+
+
+```
+
+### c. Summary of Bias Reduction
+
+The overall bias reduction potential of the model was evaluated against the test set data. The remotely sensed water temperautre measurements (LST) are adjusted by the predicted bias (LST bias) to produce the water surface temperature product (WST). The WST is compared to in-situ measurements to give WST bias. *Figure xx* shows distributions of WST and LST bias for each geographic region. In the WST, bias is centers around 0 in a normal distribution  for each region as a noticeable decrease in variance is evident compared to the LST, particularly for the Upper Colorado River Basin. The overall reduction in reduction looking at the MAE metric was 5.3 to 1.3, an almost 4-fold reduction. 
+
+```{r}
+# df_bias <- get_qrf_df(qrf_mod3, preproc_list_mod)
+df_bias <- get_prediction_df(sgb, preproc_list)
+df_bias %>% dplyr::select(starts_with('wst'),lst_bias,medianwatertempC, insitu.temp) %>% kbl() %>%
+  kable_paper("hover", full_width = F)
+
+get_bias_reduction(sgb, preproc_list)[1]
+get_bias_reduction(sgb, preproc_list)[2] %>% kbl() %>%
+  kable_paper("hover", full_width = F)
+
+get_bias_reduction(sgb, preproc_list)[3] %>% kbl() %>%
+  kable_paper("hover", full_width = F)
+```
+
+## 2. Uncertainty Model 
+
+The bias reduction model described in the previous section provided a point estimate for expected LST bias given a set of predicting variables. While there were substantial improvements is bias reduction there is still considerable deviance from the true value. For this reason, a measure of uncertainty for each prediction is given. Using random forest responses from the 75th and 25th quantile, an interquartile range for the expected value can be calculated. This feature allows for predictions to be associated with an uncertainty range, and for temperature to be adjusted with a low and high end within which most of the true temperatures will fall. 
+
+*Figure xx* shows a sample of 100 observations from the test set and their associated prediction interval along with the in-situ (truth) measurement. Prediction interval ranges show variability, but 51.3% of in-situ measurements fall within the intervals, suggesting the method provides a valid inter-quartile range. Distributions by basin suggest that ranges do not vary greatly by geographic region.  
+
+
+```{r}
+# build quantile random forest 
+qrf <- run_qrf(preproc_list, rf)
+# saveRDS(qrf, "ml_model_runs/qrf_mod_20220417.rds")
+# saveRDS(sgb, "ml_model_runs/sgb_mod_20220417.rds")
+# dataframe with qrf predictions and all variables
+qrf_df <- get_qrf_df(qrf, preproc_list)
+qrf_df %>% 
+  dplyr::select(starts_with(c("lst","wst")), uncertainty_range)
+
+# compare random forest and qunatile random forest 
+get_prediction_df(rf, preproc_list) %>% 
+  bind_cols(qrf_df) %>% 
+  dplyr::select(
+    rf_pred=wst,
+    qrf_pred=wst_qrf_mean
+  ) %>% 
+  mutate(rf_minus_qrf=rf_pred-qrf_pred) %>% 
+    summarize(mean(rf_minus_qrf),
+            sd(rf_minus_qrf))
+```
+
+
+```{r}
+# plot of the uncertainty ranges of observations from the test set
+# defaults setting is 200, but it can be set to other values of n, with the n_samples() argument
+
+### ORDER FROM HI TO LOW LST BIAS ###
+plot_obs_uncertainty(qrf_df,n_samples = 100)
+
+# are 50 percent of the observations within the interval?
+ifelse(qrf_df$lst_bias <= qrf_df$lst_bias_q75_predicted & qrf_df$lst_bias >=   qrf_df$lst_bias_q25_predicted, T,F) %>% sum/nrow(qrf_df)
+
+# summarize range by features: example  
+qrf_df %>%
+    pivot_longer(c(landpercent, waterpercent, cloudpercent, maybewaterpercent)) %>%
+    ggplot(aes(x=value, y=uncertainty_range) ) +
+      geom_point() +
+      facet_wrap(~name, scales = "free_x") +
+    ggtitle(paste0("errors by DSWE abundance in 200m zone")) +
+    ylab("IQR of error uncertainty")+
+    xlab("") +
+    scale_color_viridis_c() 
+
+```
+
+```{r}
+# summary of ranges    
+qrf_df %>% 
+   ggplot(aes(uncertainty_range))+ 
+   geom_boxplot()
+
+qrf_df %>% 
+   ggplot(aes(x=basin, y=uncertainty_range, fill=basin)) +
+   geom_violin() + 
+  scale_fill_viridis_d(option="plasma" )+
+  labs(title="Distribution of Uncertainty Ranges by Basin", x="", y="Range of 75th and 25th percentiles, degrees C") +
+  theme(legend.position="none")
+
+
+
+quantile(qrf_df$uncertainty_range) %>% t() %>%  kbl() %>%
+  kable_paper("hover", full_width = F)
+
+qrf_df %>% 
+  ggplot(aes(x=uncertainty_range,y=lst_bias_mean_predicted)) + 
+  geom_point()
+
+qrf_df %>% 
+  ggplot(aes(x=uncertainty_range,y=wst_bias_mean)) + 
+  geom_point() 
+```
+
+
+##3. Maps 
+Maps showing summary of wst and lst bias, model error, number of test set obs by station, range
+```{r}
+sp_df <- get_qrf_df(qrf, preproc_list) %>% 
+  st_as_sf(coords=c("long", "lat"), crs=st_crs(4269)) %>% 
+  group_by(sitename) %>% 
+  summarize(wst_bias=mean(wst_bias_mean),
+            lst_bias_p=mean(lst_bias_mean_predicted),
+            lst_bias_a=mean(lst_bias),
+            wst_bias_r=mean(uncertainty_range),
+            n=n(),
+            wst=mean(wst_qrf_mean)
+            )  
+# write to disk  
+st_write(sp_df, 'qfr_sp_df2.shp', driver='ESRI shapefile')
+
+mapview(sp_df, zcol='wst_bias_range') + 
+  mapview(sp_df, zcol='wst_bias') + 
+  mapview(sp_df, zcol='lst_bias_actual') + 
+  mapview(sp_df, zcol='lst_bias_prediction') 
+
+temp <- get_qrf_df(qrf, preproc_list)
+temp[temp$wst_bias_mean==max(temp$wst_bias_mean),]
+
+
+```
+
+
+# E. Spatial Applicaiton of Model 
+
+Finally, the developed bias reduction and uncertainty models are applied to Landsat 8 ARD tiles (available for download at https://earthexplorer.usgs.gov/). To apply the model to a raster dataset, an additional processing step was required; variables used as predictors in the tabular dataset are represented in raster form, calculated on a pixel-by-pixel basis for all water pixels. The R `raster` package provides geographic information system (GIS) functionality needed for raster processing, particularly when calculating temperatures and abundances within the 200 meter buffer zone for the various surface cover types (e.g. water, land ). The product contains a spatuially continuous bias-adjusted estimate of water temperature, with an inter-quartile range.   
+
+The map below, *Figure xx*, shows an example of the prod 
+
+```{r}
+
+# 
+foo <- wST_predictions("ml_model_runs/qrf_mod_20220409.rds",
+                "DRB_sat_scenes/LC08_CU_028008_20200519_20210504_02_ST_B10.tif",
+                "DRB_sat_scenes/LC08_CU_028008_20200519_20200528_C01_V01_INWM.tif",
+                "DRB_sat_scenes/LC08_CU_028008_20200519_20210504_02_ST_CDIST.tif",
+                "test_function_endpoint_update2",
+                test_extent=F
+                )
+mapview(foo$wst_mean) 
+```
+
+## 2. Map Results
+```{r}
+foo$lst %>% mapview
+# original data
+lst <- raster("test_function_endpoint_update2/LC08_CU_028008_20200519_LST.tif")
+cdist <- raster("DRB_sat_scenes/LC08_CU_028008_20200519_20210504_02_ST_CDIST.tif")
+dswe <- raster("DRB_sat_scenes/LC08_CU_028008_20200519_20200528_C01_V01_INWM.tif")
+
+# load in modeled results
+pred_err <- raster("test_function_endpoint_update2/LC08_CU_028008_20200519_wst_bias_predictions.tif")
+wst_25p <- raster("test_function_endpoint_update2/LC08_CU_028008_20200519_WST_25p.tif")
+wst_75p <- raster("test_function_endpoint_update2/LC08_CU_028008_20200519_WST_75p.tif")
+wst_mean <- raster("test_function_endpoint_update2/LC08_CU_028008_20200519_WST_mean.tif")
+wst_unc <- raster("test_function_endpoint_update2/LC08_CU_028008_20200519_WST_unc_range.tif")
+
+# map 
+mapview(lst) + 
+  pred_err + 
+  wst_25p + 
+  wst_75p +
+  wst_mean + 
+  wst_unc + 
+  cdist
+
+```
